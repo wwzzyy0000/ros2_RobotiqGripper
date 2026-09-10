@@ -13,6 +13,7 @@ find_package(ament_cmake REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
@@ -21,6 +22,15 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  add_test(
+    NAME server_mock_tests
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR}/test -p test_*.py
+  )
+  set_tests_properties(server_mock_tests PROPERTIES
+    ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+  )
 endif()
 
 # ================================================== #

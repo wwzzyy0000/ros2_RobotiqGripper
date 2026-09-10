@@ -35,6 +35,179 @@ from rclpy.node import Node
 from ros2_robotiqgripper.srv import RobotiqGripper
 import socket, time, re
 
+SOCKET_TIMEOUT = 3.0
+ACTIVATION_TIMEOUT = 10.0
+MOVEMENT_TIMEOUT = 10.0
+POLL_INTERVAL = 0.1
+GRIPPER_PORT = 63352
+
+
+class GripperError(Exception):
+    pass
+
+
+def receive_reply(gripper_socket):
+    data = gripper_socket.recv(2**10)
+    if not data:
+        raise GripperError("The gripper closed the TCP connection without replying.")
+
+    try:
+        return data.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise GripperError("The gripper returned a non-ASCII reply.") from error
+
+
+def set_variable(gripper_socket, variable, value):
+    gripper_socket.sendall(f"SET {variable} {value}\n".encode("ascii"))
+    reply = receive_reply(gripper_socket)
+    if reply.lower() != "ack":
+        raise GripperError(
+            f"Unexpected reply to SET {variable} {value}: {reply!r}."
+        )
+
+
+def get_variable(gripper_socket, variable):
+    gripper_socket.sendall(f"GET {variable}\n".encode("ascii"))
+    reply = receive_reply(gripper_socket)
+    match = re.fullmatch(rf"{re.escape(variable)}\s+(-?\d+)", reply)
+    if match is None:
+        raise GripperError(f"Malformed reply to GET {variable}: {reply!r}.")
+    return int(match.group(1))
+
+
+def raise_for_fault(fault, allowed_faults=()):
+    if fault != 0 and fault not in allowed_faults:
+        raise GripperError(f"The gripper reports fault code {fault}.")
+
+
+def check_for_fault(gripper_socket):
+    fault = get_variable(gripper_socket, "FLT")
+    raise_for_fault(fault)
+
+
+def read_initial_state(gripper_socket):
+    return {
+        variable: get_variable(gripper_socket, variable)
+        for variable in ("ACT", "STA", "GTO", "FLT", "POS")
+    }
+
+
+def wait_for_deactivation(gripper_socket):
+    deadline = time.monotonic() + ACTIVATION_TIMEOUT
+    last_act = None
+    last_status = None
+
+    while time.monotonic() < deadline:
+        last_act = get_variable(gripper_socket, "ACT")
+        last_status = get_variable(gripper_socket, "STA")
+        fault = get_variable(gripper_socket, "FLT")
+        raise_for_fault(fault, allowed_faults=(5,))
+        if last_act == 0 and last_status == 0:
+            return
+        time.sleep(POLL_INTERVAL)
+
+    raise GripperError(
+        "Timed out waiting for the activation reset "
+        f"(last ACT value: {last_act}, last STA value: {last_status})."
+    )
+
+
+def wait_for_activation(gripper_socket):
+    deadline = time.monotonic() + ACTIVATION_TIMEOUT
+    last_status = None
+    last_fault = None
+
+    while time.monotonic() < deadline:
+        last_status = get_variable(gripper_socket, "STA")
+        last_fault = get_variable(gripper_socket, "FLT")
+        raise_for_fault(last_fault, allowed_faults=(5,))
+        if last_status == 3 and last_fault == 0:
+            return
+        time.sleep(POLL_INTERVAL)
+
+    raise GripperError(
+        "Timed out waiting for gripper activation "
+        f"(last STA value: {last_status}, last FLT value: {last_fault})."
+    )
+
+
+def configure_gripper(gripper_socket, current_gto):
+    speed = get_variable(gripper_socket, "SPE")
+    force = get_variable(gripper_socket, "FOR")
+
+    if speed != 20:
+        set_variable(gripper_socket, "SPE", 20)
+    if force != 20:
+        set_variable(gripper_socket, "FOR", 20)
+    if current_gto != 1:
+        set_variable(gripper_socket, "GTO", 1)
+
+
+def prepare_gripper(gripper_socket):
+    state = read_initial_state(gripper_socket)
+    already_ready = (
+        state["ACT"] == 1 and state["STA"] == 3 and state["FLT"] == 0
+    )
+
+    if already_ready:
+        current_gto = state["GTO"]
+    else:
+        raise_for_fault(state["FLT"], allowed_faults=(5,))
+
+        set_variable(gripper_socket, "GTO", 0)
+        if state["ACT"] != 0 or state["STA"] != 0:
+            set_variable(gripper_socket, "ACT", 0)
+            wait_for_deactivation(gripper_socket)
+
+        set_variable(gripper_socket, "ACT", 1)
+        wait_for_activation(gripper_socket)
+        current_gto = 0
+
+    configure_gripper(gripper_socket, current_gto)
+    check_for_fault(gripper_socket)
+
+
+def move_gripper(gripper_socket, target_position):
+    previous_target = get_variable(gripper_socket, "PRE")
+    previous_object_status = get_variable(gripper_socket, "OBJ")
+    if previous_object_status not in (0, 1, 2, 3):
+        raise GripperError(
+            f"The gripper returned invalid OBJ value {previous_object_status}."
+        )
+
+    set_variable(gripper_socket, "POS", target_position)
+
+    deadline = time.monotonic() + MOVEMENT_TIMEOUT
+    target_accepted = previous_target == target_position
+    last_requested_position = previous_target
+    last_object_status = None
+    last_position = None
+    while time.monotonic() < deadline:
+        last_requested_position = get_variable(gripper_socket, "PRE")
+        last_object_status = get_variable(gripper_socket, "OBJ")
+        last_position = get_variable(gripper_socket, "POS")
+        fault = get_variable(gripper_socket, "FLT")
+        raise_for_fault(fault)
+
+        if last_object_status not in (0, 1, 2, 3):
+            raise GripperError(
+                f"The gripper returned invalid OBJ value {last_object_status}."
+            )
+
+        if last_requested_position == target_position:
+            target_accepted = True
+        if target_accepted and last_object_status in (1, 2, 3):
+            return last_position
+
+        time.sleep(POLL_INTERVAL)
+
+    raise GripperError(
+        "Timed out waiting for gripper movement to finish "
+        f"(last PRE value: {last_requested_position}, "
+        f"last OBJ value: {last_object_status}, "
+        f"last POS value: {last_position})."
+    )
+
 # ===== INPUT PARAMETER ===== #
 PARAM_IP = "0.0.0.0"
 P_CHECK_IP = False
@@ -79,63 +252,34 @@ class serviceServer(Node):
         response.value = -1
         response.average = -1.0
 
-        # TCP-IP + SOCKET settings:
-        HOST = self.ip
-        PORT = 63352
-
-        # SOCKET COMMUNICATION:
-        SCKT = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        SCKT.settimeout(3) # Timeout of 3 seconds.
-
-        # OPEN socket:
-        while True:
-            try:
-                SCKT.connect((HOST, PORT))
-                break
-            except TimeoutError:
-                response.message = "ERROR: TCP-IP socket connection timed out! Please verify IP address and PORT."
-                return(response)
-            except ConnectionRefusedError:
-                response.message = "ERROR: TCP-IP socket connection was refused! Please verify IP address and PORT."
-                return(response)
-
-        if request.action == "CLOSE":
-
-            SCKT.sendall(b'SET POS 255\n')
-            ignore = SCKT.recv(2**10)
-            time.sleep(1.0)
-            SCKT.sendall(b'GET POS\n')
-            data = SCKT.recv(2**10)
-
-            GripperPos_STR = int(re.search(r'\d+', str(data)).group())
-            AVERAGE = round((float(GripperPos_STR)/255.0)*100.0, 2)
-
-            response.success = True
-            response.value = GripperPos_STR
-            response.average = AVERAGE
-            response.message = "CLOSE command successfully sent to Robotiq gripper. After execution, the gripper is -> " + str(AVERAGE) + "% CLOSED."
-            return(response)
-
-        elif request.action == "OPEN":
-
-            SCKT.sendall(b'SET POS 0\n')
-            ignore = SCKT.recv(2**10)
-            time.sleep(1.0)
-            SCKT.sendall(b'GET POS\n')
-            data = SCKT.recv(2**10)
-
-            GripperPos_STR = int(re.search(r'\d+', str(data)).group())
-            AVERAGE = round((float(GripperPos_STR)/255.0)*100.0, 2)
-
-            response.success = True
-            response.value = GripperPos_STR
-            response.average = AVERAGE
-            response.message = "OPEN command successfully sent to Robotiq gripper. After execution, the gripper is -> " + str(AVERAGE) + "% CLOSED."
-            return(response)
-
-        else:
+        if request.action not in ("OPEN", "CLOSE"):
             response.message = "ERROR: Valid commands are OPEN/CLOSE. Please try again."
             return(response)
+
+        target_position = 255 if request.action == "CLOSE" else 0
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_socket:
+                gripper_socket.settimeout(SOCKET_TIMEOUT)
+                gripper_socket.connect((self.ip, GRIPPER_PORT))
+
+                prepare_gripper(gripper_socket)
+                gripper_position = move_gripper(gripper_socket, target_position)
+        except (GripperError, OSError) as error:
+            response.message = (
+                "ERROR: Communication with Robotiq gripper failed: " + str(error)
+            )
+            return(response)
+
+        average = round((float(gripper_position)/255.0)*100.0, 2)
+        response.success = True
+        response.value = gripper_position
+        response.average = average
+        response.message = (
+            f"{request.action} command successfully sent to Robotiq gripper. "
+            f"After execution, the gripper is -> {average}% CLOSED."
+        )
+        return(response)
 
 # =================== MAIN =================== #
 def main(args=None):
@@ -163,5 +307,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-
