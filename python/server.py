@@ -33,17 +33,46 @@
 import rclpy
 from rclpy.node import Node
 from ros2_robotiqgripper.srv import RobotiqGripper
-import socket, time, re
+from sensor_msgs.msg import JointState
+import socket, time, re, threading
 
 SOCKET_TIMEOUT = 3.0
 ACTIVATION_TIMEOUT = 10.0
 MOVEMENT_TIMEOUT = 10.0
 POLL_INTERVAL = 0.1
 GRIPPER_PORT = 63352
+IDLE_POLL_RATE_HZ = 10.0
+GRIPPER_OPEN_POSITION = 3
+GRIPPER_CLOSED_POSITION = 230
+GRIPPER_POSITION_RANGE = GRIPPER_CLOSED_POSITION - GRIPPER_OPEN_POSITION
+GRIPPER_CLOSED_JOINT_POSITION = 0.7929
+
+JOINT_SUFFIXES = (
+    "robotiq_85_left_knuckle_joint",
+    "robotiq_85_right_knuckle_joint",
+    "robotiq_85_left_inner_knuckle_joint",
+    "robotiq_85_right_inner_knuckle_joint",
+    "robotiq_85_left_finger_tip_joint",
+    "robotiq_85_right_finger_tip_joint",
+)
+JOINT_SIGNS = (1.0, -1.0, 1.0, -1.0, -1.0, 1.0)
 
 
 class GripperError(Exception):
     pass
+
+
+def position_to_joint_angle(position):
+    normalized = (position - GRIPPER_OPEN_POSITION) / GRIPPER_POSITION_RANGE
+    normalized = max(0.0, min(normalized, 1.0))
+    return GRIPPER_CLOSED_JOINT_POSITION * normalized
+
+
+def joint_names_and_positions(joint_prefix, position):
+    angle = position_to_joint_angle(position)
+    names = [joint_prefix + suffix for suffix in JOINT_SUFFIXES]
+    positions = [sign * angle for sign in JOINT_SIGNS]
+    return names, positions
 
 
 def receive_reply(gripper_socket):
@@ -167,7 +196,13 @@ def prepare_gripper(gripper_socket):
     check_for_fault(gripper_socket)
 
 
-def move_gripper(gripper_socket, target_position):
+def read_and_publish_position(gripper_socket, position_callback):
+    position = get_variable(gripper_socket, "POS")
+    position_callback(position)
+    return position
+
+
+def move_gripper(gripper_socket, target_position, position_callback=None):
     previous_target = get_variable(gripper_socket, "PRE")
     previous_object_status = get_variable(gripper_socket, "OBJ")
     if previous_object_status not in (0, 1, 2, 3):
@@ -186,6 +221,8 @@ def move_gripper(gripper_socket, target_position):
         last_requested_position = get_variable(gripper_socket, "PRE")
         last_object_status = get_variable(gripper_socket, "OBJ")
         last_position = get_variable(gripper_socket, "POS")
+        if position_callback is not None:
+            position_callback(last_position)
         fault = get_variable(gripper_socket, "FLT")
         raise_for_fault(fault)
 
@@ -244,6 +281,51 @@ class serviceServer(Node):
         self.SERVICE = self.create_service(RobotiqGripper, "Robotiq_Gripper", self.ExecuteService)
 
         self.ip = IP
+        self.declare_parameter('joint_prefix', '')
+        self.declare_parameter('idle_poll_rate_hz', IDLE_POLL_RATE_HZ)
+        self.joint_prefix = self.get_parameter(
+            'joint_prefix').get_parameter_value().string_value
+        idle_poll_rate_hz = self.get_parameter(
+            'idle_poll_rate_hz').get_parameter_value().double_value
+
+        if not self.joint_prefix:
+            raise ValueError("The joint_prefix parameter must not be empty.")
+        if idle_poll_rate_hz <= 0.0:
+            raise ValueError("The idle_poll_rate_hz parameter must be positive.")
+
+        self.joint_state_publisher = self.create_publisher(
+            JointState, "/joint_states", 10)
+        self.socket_lock = threading.Lock()
+        self.position_timer = self.create_timer(
+            1.0 / idle_poll_rate_hz, self.PollPosition)
+
+    def PublishPosition(self, gripper_position):
+        message = JointState()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.name, message.position = joint_names_and_positions(
+            self.joint_prefix, gripper_position)
+        self.joint_state_publisher.publish(message)
+
+    def PollPosition(self):
+        # A non-blocking acquisition also protects this node if it is later moved
+        # to a multi-threaded executor. Service commands always take precedence.
+        if not self.socket_lock.acquire(blocking=False):
+            return
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_socket:
+                gripper_socket.settimeout(SOCKET_TIMEOUT)
+                gripper_socket.connect((self.ip, GRIPPER_PORT))
+                read_and_publish_position(gripper_socket, self.PublishPosition)
+        except (GripperError, OSError) as error:
+            # Do not publish the last known position with a new timestamp. The
+            # next timer invocation will try to obtain a fresh sample instead.
+            self.get_logger().warning(
+                "Unable to read a fresh Robotiq gripper position: " + str(error),
+                throttle_duration_sec=5000,
+            )
+        finally:
+            self.socket_lock.release()
 
     def ExecuteService(self, request, response):
 
@@ -259,12 +341,17 @@ class serviceServer(Node):
         target_position = 255 if request.action == "CLOSE" else 0
 
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_socket:
-                gripper_socket.settimeout(SOCKET_TIMEOUT)
-                gripper_socket.connect((self.ip, GRIPPER_PORT))
+            with self.socket_lock:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_socket:
+                    gripper_socket.settimeout(SOCKET_TIMEOUT)
+                    gripper_socket.connect((self.ip, GRIPPER_PORT))
 
-                prepare_gripper(gripper_socket)
-                gripper_position = move_gripper(gripper_socket, target_position)
+                    prepare_gripper(gripper_socket)
+                    gripper_position = move_gripper(
+                        gripper_socket,
+                        target_position,
+                        self.PublishPosition,
+                    )
         except (GripperError, OSError) as error:
             response.message = (
                 "ERROR: Communication with Robotiq gripper failed: " + str(error)
@@ -302,7 +389,7 @@ def main(args=None):
     # Spin service:
     rclpy.spin(GripperNode)
 
-    GripperNode.destroy_node
+    GripperNode.destroy_node()
     rclpy.shutdown()
 
 if __name__ == '__main__':
